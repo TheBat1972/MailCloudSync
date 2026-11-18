@@ -1,0 +1,172 @@
+import Cocoa
+
+/// Значок в строке меню и его меню. Во время синхронизации значок вращается и показывает проценты.
+final class StatusController: NSObject, NSMenuDelegate {
+    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let menu = NSMenu()
+    private var status: SyncStatus = .notConfigured
+    private var animTimer: Timer?
+    private var angle: CGFloat = 0
+
+    var onOpenSettings: (() -> Void)?
+    var onOpenActivity: (() -> Void)?
+    var onSyncNow: (() -> Void)?
+    var onTogglePause: (() -> Void)?
+    var onConfirmDeletes: (() -> Void)?
+
+    override init() {
+        super.init()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        item.menu = menu
+        item.button?.imagePosition = .imageLeft
+        update(.notConfigured)
+    }
+
+    // MARK: значок
+
+    /// Буква рядом со значком отличает этот клиент от второго.
+    static let letter = "М"
+    private var spinBase: NSImage?
+
+    private func symbol(_ names: [String]) -> NSImage? {
+        for n in names {
+            if let img = NSImage(systemSymbolName: n, accessibilityDescription: "Облако Mail.ru") { return img }
+        }
+        return nil
+    }
+
+    /// Значок (можно повернуть) + буква справа. Шаблонное изображение — подстраивается под тёмную/светлую строку меню.
+    private func compose(_ base: NSImage?, rotation: CGFloat = 0, alpha: CGFloat = 1) -> NSImage {
+        let side: CGFloat = 18
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .heavy),
+            .foregroundColor: NSColor.black.withAlphaComponent(alpha)]
+        let letter = StatusController.letter as NSString
+        let ls = letter.size(withAttributes: attrs)
+        let img = NSImage(size: NSSize(width: side + 1 + ls.width, height: side), flipped: false) { _ in
+            if let base = base {
+                NSGraphicsContext.saveGraphicsState()
+                let t = NSAffineTransform()
+                t.translateX(by: side / 2, yBy: side / 2)
+                t.rotate(byDegrees: rotation)
+                t.translateX(by: -side / 2, yBy: -side / 2)
+                t.concat()
+                let s = base.size
+                let k = min(side / s.width, side / s.height) * 0.9
+                let w = s.width * k, h = s.height * k
+                base.draw(in: NSRect(x: (side - w) / 2, y: (side - h) / 2, width: w, height: h),
+                          from: .zero, operation: .sourceOver, fraction: alpha)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            letter.draw(at: NSPoint(x: side + 1, y: (side - ls.height) / 2), withAttributes: attrs)
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+
+    private func startSpinning() {
+        guard animTimer == nil else { return }
+        spinBase = symbol(["arrow.triangle.2.circlepath"])
+        animTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.angle -= 30
+            self.item.button?.image = self.compose(self.spinBase, rotation: self.angle)
+        }
+    }
+
+    private func stopSpinning() {
+        animTimer?.invalidate()
+        animTimer = nil
+        angle = 0
+    }
+
+    func update(_ s: SyncStatus) {
+        status = s
+        switch s {
+        case .syncing(_, let fraction):
+            startSpinning()
+            item.button?.image = compose(spinBase ?? symbol(["arrow.triangle.2.circlepath"]), rotation: angle)
+            if let f = fraction { item.button?.title = " \(Int(f * 100))%" } else { item.button?.title = "" }
+        case .error, .needsConfirmation:
+            stopSpinning()
+            item.button?.title = ""
+            item.button?.image = compose(symbol(["externaldrive.badge.exclamationmark", "exclamationmark.triangle"]))
+        case .paused:
+            stopSpinning()
+            item.button?.title = ""
+            item.button?.image = compose(symbol(["pause.circle"]))
+        case .idle:
+            stopSpinning()
+            item.button?.title = ""
+            item.button?.image = compose(symbol(["externaldrive.badge.checkmark", "externaldrive"]))
+        case .notConfigured:
+            stopSpinning()
+            item.button?.title = ""
+            item.button?.image = compose(symbol(["externaldrive.badge.questionmark", "externaldrive"]), alpha: 0.5)
+        }
+        rebuild()
+    }
+
+    // MARK: меню
+
+    func menuNeedsUpdate(_ menu: NSMenu) { rebuild() }
+
+    private func line(_ text: String, tip: String? = nil) {
+        let short = text.count > 70 ? String(text.prefix(70)) + "…" : text
+        let it = NSMenuItem(title: short, action: nil, keyEquivalent: "")
+        it.isEnabled = false
+        it.toolTip = tip ?? text
+        menu.addItem(it)
+    }
+
+    private func action(_ title: String, _ sel: Selector, _ key: String = "") {
+        let it = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+        it.target = self
+        menu.addItem(it)
+    }
+
+    private func rebuild() {
+        menu.removeAllItems()
+        switch status {
+        case .notConfigured: line("Нужна настройка: подключите аккаунт и выберите папки")
+        case .paused: line("Синхронизация приостановлена")
+        case .syncing(let t, _): line(t)
+        case .idle(let date, let summary):
+            let f = DateFormatter(); f.dateFormat = "HH:mm"
+            line("Синхронизировано в \(f.string(from: date))")
+            if !summary.isEmpty { line(summary) }
+        case .error(let m): line("Ошибка: " + m, tip: m)
+        case .needsConfirmation(let m): line(m)
+        }
+        menu.addItem(.separator())
+
+        action("Журнал синхронизации…", #selector(openActivity), "l")
+        if Settings.shared.isConfigured {
+            action("Открыть папку на Маке", #selector(openFolder), "o")
+        }
+        action("Открыть Облако Mail.ru в браузере", #selector(openWeb))
+        menu.addItem(.separator())
+
+        if case .needsConfirmation = status {
+            action("Подтвердить удаление и синхронизировать", #selector(confirmDeletes))
+        }
+        if Settings.shared.isConfigured {
+            action("Синхронизировать сейчас", #selector(syncNow), "r")
+            action(Settings.shared.paused ? "Возобновить" : "Приостановить", #selector(togglePause))
+            menu.addItem(.separator())
+        }
+        action("Настройки…", #selector(openSettings), ",")
+        action("Выйти", #selector(quit), "q")
+    }
+
+    @objc private func openFolder() { NSWorkspace.shared.open(URL(fileURLWithPath: Settings.shared.localFolder)) }
+    @objc private func openWeb() { NSWorkspace.shared.open(URL(string: "https://cloud.mail.ru")!) }
+    @objc private func syncNow() { onSyncNow?() }
+    @objc private func togglePause() { onTogglePause?() }
+    @objc private func confirmDeletes() { onConfirmDeletes?() }
+    @objc private func openSettings() { onOpenSettings?() }
+    @objc private func openActivity() { onOpenActivity?() }
+    @objc private func quit() { NSApp.terminate(nil) }
+}
