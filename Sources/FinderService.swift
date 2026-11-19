@@ -17,7 +17,7 @@ enum CloudOpener {
     }
 
     static func webURL(forLocal path: String) throws -> URL {
-        var rel = try relativePath(forLocal: path)
+        var rel = CloudName.toCloud(try relativePath(forLocal: path))
         var isDir: ObjCBool = false
         FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
         // для файла открываем папку, в которой он лежит
