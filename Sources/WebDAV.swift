@@ -1,6 +1,6 @@
 import Foundation
 
-struct RemoteItem {
+struct RemoteItem: Codable {
     let isDir: Bool
     let size: Int64
     let modified: Date
@@ -171,7 +171,7 @@ final class WebDAVClient {
 
     private func propfind(_ path: String, depth: Int, dir: Bool) throws -> (entries: [MultistatusParser.Entry], code: Int) {
         let (d, c) = try request("PROPFIND", path, dir: dir,
-                                 headers: ["Depth": String(depth), "Content-Type": "application/xml; charset=utf-8"],
+                                 headers: ["Depth": depth < 0 ? "infinity" : String(depth), "Content-Type": "application/xml; charset=utf-8"],
                                  body: WebDAVClient.propBody)
         if c == 404 { return ([], 404) }
         guard c == 207 || c == 200 else { throw SyncError.http(c, text(d)) }
@@ -221,7 +221,7 @@ final class WebDAVClient {
             var next: [String] = []
             var firstError: Error?
             var rootMissing = false
-            let limiter = DispatchSemaphore(value: 4)
+            let limiter = DispatchSemaphore(value: 4)   // больше — сервер начинает отвечать медленнее
             let group = DispatchGroup()
             for dir in level {
                 lock.lock(); let stop = firstError != nil; lock.unlock()
@@ -257,6 +257,73 @@ final class WebDAVClient {
             if rootMissing { return nil }
             level = next
         }
+        return result
+    }
+
+    /// Чтение всего дерева одним запросом (PROPFIND с Depth: infinity), если сервер это позволяет.
+    /// Бросает ошибку, если не позволяет или ответ выглядит неполным, — тогда читаем по папкам.
+    /// nil — самой папки нет.
+    func listTreeFast(root: String, knownDirs: Set<String>,
+                      progress: ((Int, Int) -> Void)? = nil) throws -> [String: RemoteItem]? {
+        let key = "webdavInfinityFailedAt"
+        let failedAt = UserDefaults.standard.double(forKey: key)
+        if failedAt > 0 && Date().timeIntervalSince1970 - failedAt < 7 * 86400 {
+            throw SyncError.bad("Depth: infinity не поддерживается")
+        }
+        let rootPath = normalize(root)
+        func unsupported(_ why: String) -> SyncError {
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: key)
+            return SyncError.bad("Depth: infinity: " + why)
+        }
+        // Пробный запрос: одна попытка и короткий тайм-аут — сервер может просто не отвечать на такой запрос.
+        guard let u = url(rootPath, dir: true) else { throw SyncError.bad("Некорректный путь") }
+        var req = URLRequest(url: u)
+        req.httpMethod = "PROPFIND"
+        req.timeoutInterval = 60      // законное долгое чтение дерева успеет; раз в неделю потерять минуту — не страшно
+        req.setValue(auth, forHTTPHeaderField: "Authorization")
+        req.setValue("infinity", forHTTPHeaderField: "Depth")
+        req.setValue("application/xml; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        req.httpBody = WebDAVClient.propBody
+        let sem = DispatchSemaphore(value: 0)
+        var out: (Data?, URLResponse?, Error?) = (nil, nil, nil)
+        session.dataTask(with: req) { d, r, e in out = (d, r, e); sem.signal() }.resume()
+        sem.wait()
+        let code = (out.1 as? HTTPURLResponse)?.statusCode ?? 0
+        if let e = out.2 as? URLError {
+            // настоящий обрыв связи — это не «не поддерживается»
+            if [.notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost,
+                .dnsLookupFailed].contains(e.code) { throw SyncError.network(e.localizedDescription) }
+            throw unsupported("нет ответа за 60 с")
+        }
+        if out.2 != nil || code == 0 { throw unsupported("нет ответа") }
+        if code == 401 { throw SyncError.unauthorized }
+        if code == 404 { return nil }
+        guard code == 207 || code == 200 else { throw unsupported("код \(code)") }
+        let parser = MultistatusParser()
+        let xml = XMLParser(data: out.0 ?? Data())
+        xml.shouldProcessNamespaces = true
+        xml.delegate = parser
+        xml.parse()
+        let r = (entries: parser.entries, code: code)
+        if r.code == 404 { return nil }
+
+        let prefix = rootPath == "/" ? "/" : rootPath + "/"
+        var result: [String: RemoteItem] = [:]
+        var nested = false
+        for e in r.entries {
+            let path = hrefPath(e.href)
+            if path == rootPath || !path.hasPrefix(prefix) { continue }
+            let rel = String(path.dropFirst(prefix.count)).precomposedStringWithCanonicalMapping
+            if rel.isEmpty { continue }
+            if rel.contains("/") { nested = true }
+            result[rel] = RemoteItem(isDir: e.isDir, size: e.size, modified: e.modified ?? Date(), apiPath: path)
+        }
+        progress?(result.values.filter { $0.isDir }.count, result.count)
+        // Сервер мог молча прочитать только один уровень — тогда вложенного нет вообще.
+        if !nested && !knownDirs.isEmpty { throw unsupported("ответ без вложенных папок") }
+        // Если известные нам папки массово «пропали», ответ неполный.
+        let gone = knownDirs.filter { result[$0] == nil }.count
+        if gone > 5 && gone * 20 > knownDirs.count { throw SyncError.bad("Depth: infinity: ответ неполный") }
         return result
     }
 
