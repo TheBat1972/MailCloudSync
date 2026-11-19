@@ -208,20 +208,54 @@ final class WebDAVClient {
     }
 
     /// Рекурсивный список содержимого. Ключ — относительный путь (NFC). nil, если папки нет.
-    func listTree(root: String) throws -> [String: RemoteItem]? {
-        var result: [String: RemoteItem] = [:]
-        var stack = [normalize(root)]
+    /// Папки читаются по уровням, по несколько запросов одновременно (Облако отвечает небыстро).
+    /// progress(папок прочитано, объектов найдено) вызывается из фоновых потоков.
+    func listTree(root: String, progress: ((Int, Int) -> Void)? = nil) throws -> [String: RemoteItem]? {
         let rootPath = normalize(root)
-        while let dir = stack.popLast() {
-            guard let items = try list(dir) else {
-                if dir == rootPath { return nil }
-                continue
+        var result: [String: RemoteItem] = [:]
+        var level = [rootPath]
+        var folders = 0
+        let lock = NSLock()
+        let q = DispatchQueue.global(qos: .utility)
+        while !level.isEmpty {
+            var next: [String] = []
+            var firstError: Error?
+            var rootMissing = false
+            let limiter = DispatchSemaphore(value: 4)
+            let group = DispatchGroup()
+            for dir in level {
+                lock.lock(); let stop = firstError != nil; lock.unlock()
+                if stop { break }
+                limiter.wait()
+                group.enter()
+                q.async {
+                    defer { limiter.signal(); group.leave() }
+                    do {
+                        guard let items = try self.list(dir) else {
+                            if dir == rootPath { lock.lock(); rootMissing = true; lock.unlock() }
+                            return
+                        }
+                        lock.lock()
+                        for (_, item) in items {
+                            let rel = String(item.apiPath.dropFirst(rootPath == "/" ? 1 : rootPath.count + 1))
+                            result[rel.precomposedStringWithCanonicalMapping] = item
+                            if item.isDir { next.append(item.apiPath) }
+                        }
+                        folders += 1
+                        let f = folders, n = result.count
+                        lock.unlock()
+                        progress?(f, n)
+                    } catch {
+                        lock.lock()
+                        if firstError == nil { firstError = error }
+                        lock.unlock()
+                    }
+                }
             }
-            for (_, item) in items {
-                let rel = String(item.apiPath.dropFirst(rootPath == "/" ? 1 : rootPath.count + 1))
-                result[rel.precomposedStringWithCanonicalMapping] = item
-                if item.isDir { stack.append(item.apiPath) }
-            }
+            group.wait()
+            if let e = firstError { throw e }
+            if rootMissing { return nil }
+            level = next
         }
         return result
     }

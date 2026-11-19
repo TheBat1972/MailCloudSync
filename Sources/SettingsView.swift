@@ -286,6 +286,13 @@ struct SettingsView: View {
                 Text("(изменения на Маке отправляются сразу)").font(.caption).foregroundColor(.secondary)
                 Spacer()
             }
+            HStack {
+                Button("Включить «Открыть в Облаке Mail.ru» в меню Finder") {
+                    ServiceSetup.enableWithGuide()
+                }
+                Text("правый клик → Службы").font(.caption).foregroundColor(.secondary)
+                Spacer()
+            }
             if #available(macOS 13.0, *) {
                 Toggle("Запускать при входе в систему", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { on in

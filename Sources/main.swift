@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tray = StatusController()
     private let settingsWindow = SettingsWindowController()
     private let activityWindow = ActivityWindowController()
+    private let serviceProvider = ServiceProvider()
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         installMainMenu()
@@ -19,6 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         tray.onOpenSettings = { [weak self] in self?.openSettings() }
         tray.onOpenActivity = { [weak self] in self?.openActivity() }
+        tray.onOpenInCloud = { CloudOpener.chooseAndOpen() }
+        NSApp.servicesProvider = serviceProvider
+        NSUpdateDynamicServices()
+        ServiceSetup.enableOnFirstLaunch()
         tray.onSyncNow = { [weak self] in self?.engine.requestSync() }
         tray.onConfirmDeletes = { [weak self] in self?.engine.requestSync(allowMassDelete: true) }
         tray.onTogglePause = { [weak self] in

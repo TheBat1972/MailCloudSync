@@ -101,7 +101,17 @@ final class SyncEngine {
     func requestSync(allowMassDelete: Bool = false) {
         guard settings.isConfigured, !settings.paused else { return }
         if !isOnline {
-            onStatus?(.error("Нет подключения к интернету — синхронизация продолжится, когда сеть вернётся"))
+            // Флаг мог устареть (система не всегда сообщает, что сеть вернулась) — проверяем по-настоящему.
+            probeOnline { [weak self] ok in
+                guard let self = self else { return }
+                if ok {
+                    self.setOnline(true)
+                    DispatchQueue.main.async { self.requestSync(allowMassDelete: allowMassDelete) }
+                } else {
+                    self.onStatus?(.error("Нет подключения к интернету — синхронизация продолжится, когда сеть вернётся"))
+                    self.retryIfTransient(SyncError.network("нет связи"))
+                }
+            }
             return
         }
         lock.lock()
@@ -122,6 +132,7 @@ final class SyncEngine {
             do {
                 let summary = try runCycle(allowMassDelete: allow)
                 lastLoggedError = nil
+                retryReset()
                 onStatus?(.idle(Date(), summary))
             } catch SyncError.needsConfirmation(let m) {
                 ActivityLog.shared.add(.error, "Нужно подтверждение удаления", m)
@@ -133,10 +144,59 @@ final class SyncEngine {
                 if m != lastLoggedError { ActivityLog.shared.add(.error, "Синхронизация не удалась", m) }
                 lastLoggedError = m
                 onStatus?(.error(m))
+                retryIfTransient(error)
             }
             lock.lock()
             if !pending { running = false; lock.unlock(); return }
             lock.unlock()
+        }
+    }
+
+    private func setOnline(_ v: Bool) {
+        lock.lock(); online = v; lock.unlock()
+    }
+
+    /// Достаточно любого ответа сервера (даже с ошибкой) — значит, связь есть.
+    private func probeOnline(_ done: @escaping (Bool) -> Void) {
+        guard let url = URL(string: "https://webdav.cloud.mail.ru") else { done(true); return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        req.timeoutInterval = 6
+        URLSession.shared.dataTask(with: req) { _, resp, err in done(resp != nil || err == nil) }.resume()
+    }
+
+    // MARK: - Повтор после сбоя связи
+
+    private var retryDelay: Double = 10
+    private var retryItem: DispatchWorkItem?
+
+    private func retryReset() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.retryItem?.cancel()
+            self.retryItem = nil
+            self.retryDelay = 10
+        }
+    }
+
+    /// Короткий обрыв сети может не заметить даже монитор сети — после сбоя связи или ответа сервера 5xx/429
+    /// повторяем сами: через 10 секунд, затем реже (до 2 минут), пока не получится.
+    private func retryIfTransient(_ error: Error) {
+        var transient = false
+        switch error {
+        case SyncError.network: transient = true
+        case SyncError.http(let c, _): transient = (c == 429 || c >= 500)
+        default: break
+        }
+        guard transient else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.retryItem?.cancel()
+            let delay = self.retryDelay
+            self.retryDelay = min(self.retryDelay * 2, 120)
+            let item = DispatchWorkItem { [weak self] in self?.requestSync() }
+            self.retryItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         }
     }
 
@@ -251,10 +311,23 @@ final class SyncEngine {
 
         // Облако
         var remote: [String: RemoteItem] = [:]
+        let readStart = Date()
+        var lastTick = Date.distantPast
+        let tickLock = NSLock()
         for sel in selections {
             let selRel = sel == "/" ? "" : String(sel.dropFirst())
             let dirItem = RemoteItem(isDir: true, size: 0, modified: Date(), apiPath: sel)
-            if let tree = try api.listTree(root: sel) {
+            let tree = try api.listTree(root: sel) { folders, objects in
+                tickLock.lock()
+                let now = Date()
+                let show = now.timeIntervalSince(lastTick) > 0.3
+                if show { lastTick = now }
+                tickLock.unlock()
+                if show {
+                    self.onStatus?(.syncing("Чтение Облака: папок \(folders), объектов \(objects)…", nil))
+                }
+            }
+            if let tree = tree {
                 if !selRel.isEmpty { remote[selRel] = dirItem }
                 for (rel, item) in tree { remote[selRel.isEmpty ? rel : selRel + "/" + rel] = item }
             } else if selRel.isEmpty {
@@ -265,6 +338,10 @@ final class SyncEngine {
             }
             // иначе папку удалили в Облаке: локальные копии уйдут по правилам удаления
         }
+
+        ActivityLog.shared.add(.info, "Список Облака получен: \(remote.count) объектов",
+                               String(format: "за %.0f с", Date().timeIntervalSince(readStart)))
+        onStatus?(.syncing("Просмотр папки на Маке…", nil))
 
         // Локальная папка (только то, что внутри выбранного)
         let local = try scanLocal(localRoot).filter { inSelection($0.key) }

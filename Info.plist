@@ -13,5 +13,16 @@
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSServices</key>
+    <array>
+        <dict>
+            <key>NSMenuItem</key>
+            <dict><key>default</key><string>Открыть в Облаке Mail.ru</string></dict>
+            <key>NSMessage</key><string>openInCloud</string>
+            <key>NSPortName</key><string>MailCloudSync</string>
+            <key>NSSendFileTypes</key>
+            <array><string>public.item</string></array>
+        </dict>
+    </array>
 </dict>
 </plist>
