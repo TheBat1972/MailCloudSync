@@ -355,6 +355,16 @@ final class WebDAVClient {
         }
     }
 
+    /// Переименование или перенос папки одним запросом (WebDAV MOVE): содержимое остаётся на месте.
+    func move(_ from: String, to: String, isDir: Bool) throws {
+        guard let dest = url(to, dir: isDir) else { throw SyncError.bad("Некорректный путь") }
+        let parent = (to as NSString).deletingLastPathComponent
+        if !parent.isEmpty && parent != "/" { try ensureDir(parent) }
+        let (d, c) = try request("MOVE", from, dir: isDir, headers: ["Destination": dest.absoluteString, "Overwrite": "F"])
+        if c == 201 || c == 204 { return }
+        throw SyncError.http(c, text(d))
+    }
+
     func delete(_ path: String, isDir: Bool) throws {
         let (d, c) = try request("DELETE", path, dir: isDir)
         if c == 200 || c == 204 || c == 404 { return }
@@ -387,20 +397,30 @@ final class WebDAVClient {
 
     func upload(_ file: URL, to path: String) throws {
         guard let u = url(path, dir: false) else { throw SyncError.bad("Некорректный путь") }
-        var req = URLRequest(url: u)
-        req.httpMethod = "PUT"
-        req.setValue(auth, forHTTPHeaderField: "Authorization")
-        let sem = DispatchSemaphore(value: 0)
-        var err: Error?
-        var status = 0
-        session.uploadTask(with: req, fromFile: file) { _, resp, e in
-            err = e
-            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            sem.signal()
-        }.resume()
-        sem.wait()
-        if let e = err { throw SyncError.network(e.localizedDescription) }
-        if status == 401 { throw SyncError.unauthorized }
-        if ![200, 201, 204].contains(status) { throw SyncError.http(status, "ошибка загрузки") }
+        // Сервер при большой нагрузке иногда не отвечает вовремя; PUT безопасно повторять, поэтому до трёх попыток.
+        var attempt = 0
+        while true {
+            var req = URLRequest(url: u)
+            req.httpMethod = "PUT"
+            req.setValue(auth, forHTTPHeaderField: "Authorization")
+            let sem = DispatchSemaphore(value: 0)
+            var err: Error?
+            var status = 0
+            session.uploadTask(with: req, fromFile: file) { _, resp, e in
+                err = e
+                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                sem.signal()
+            }.resume()
+            sem.wait()
+            if (err != nil || status == 429 || status >= 500) && attempt < 2 {
+                attempt += 1
+                Thread.sleep(forTimeInterval: Double(attempt) * 4)
+                continue
+            }
+            if let e = err { throw SyncError.network(e.localizedDescription) }
+            if status == 401 { throw SyncError.unauthorized }
+            if ![200, 201, 204].contains(status) { throw SyncError.http(status, "ошибка загрузки") }
+            return
+        }
     }
 }
