@@ -397,7 +397,7 @@ final class WebDAVClient {
 
     func upload(_ file: URL, to path: String) throws {
         guard let u = url(path, dir: false) else { throw SyncError.bad("Некорректный путь") }
-        // Сервер при большой нагрузке иногда не отвечает вовремя; PUT безопасно повторять, поэтому до трёх попыток.
+        // Сервер при большой нагрузке иногда не отвечает вовремя; PUT безопасно повторять, поэтому до четырёх попыток (в том числе при 408 — сервер не дождался данных).
         var attempt = 0
         while true {
             var req = URLRequest(url: u)
@@ -412,9 +412,9 @@ final class WebDAVClient {
                 sem.signal()
             }.resume()
             sem.wait()
-            if (err != nil || status == 429 || status >= 500) && attempt < 2 {
+            if (err != nil || status == 408 || status == 429 || status >= 500) && attempt < 3 {
                 attempt += 1
-                Thread.sleep(forTimeInterval: Double(attempt) * 4)
+                Thread.sleep(forTimeInterval: Double(attempt) * 5)
                 continue
             }
             if let e = err { throw SyncError.network(e.localizedDescription) }

@@ -43,7 +43,9 @@ final class StatusController: NSObject, NSMenuDelegate {
     private var currentMark: Mark {
         switch status {
         case .idle: return .ok
-        case .error: return .fail
+        case .error(let m):
+            // Часть файлов не передалась (сообщение начинается с «Ошибок: N»), остальное синхронизировано — это предупреждение, а не сбой.
+            return m.hasPrefix("Ошибок:") ? .warn : .fail
         case .needsConfirmation: return .warn
         case .syncing: return .work
         case .paused: return .pause
@@ -191,7 +193,6 @@ final class StatusController: NSObject, NSMenuDelegate {
             action("Открыть папку на Маке", #selector(openFolder), "o")
         }
         action("Открыть Облако Mail.ru в браузере", #selector(openWeb))
-        action("Открыть корзину Облака", #selector(openTrash))
         if Settings.shared.isConfigured {
             action("Файл в Облаке (для ссылки)…", #selector(openInCloud), "k")
         }
@@ -208,7 +209,6 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     @objc private func openFolder() { NSWorkspace.shared.open(URL(fileURLWithPath: Settings.shared.localFolder)) }
     @objc private func openWeb() { NSWorkspace.shared.open(URL(string: "https://cloud.mail.ru")!) }
-    @objc private func openTrash() { NSWorkspace.shared.open(URL(string: "https://cloud.mail.ru/trash/")!) }
     @objc private func openInCloud() { onOpenInCloud?() }
     @objc private func syncNow() { onSyncNow?() }
     @objc private func togglePause() { onTogglePause?() }
